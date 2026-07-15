@@ -8,16 +8,35 @@ Cada sindicato tem 4 boletos (8 no total):
   - Telemedicina          (R$ 10,00)
 
 Identificação:
-  1. Pelo nome do arquivo (SINDSEG ou SINDIVIGILANTES).
-  2. Pela pasta dentro do ZIP (ODONTO SINDSEG / ODONTO SINDIVIGILANTES).
-  3. Pelo valor majoritário (excluindo zerados) caso 1 e 2 falhem.
+  1. Pela linha-título (row 1 do NOVO formato: "Relação de dependente para SINDSEG-GV/ES ...").
+  2. Pelo nome do arquivo (SINDSEG ou SINDIVIGILANTES).
+  3. Pela pasta dentro do ZIP (ODONTO SINDSEG / ODONTO SINDIVIGILANTES).
+  4. Pela coluna 'Sindicato' das linhas de dados (novo formato).
+  5. Pelo valor majoritário (excluindo zerados) caso 1-4 falhem.
 
-Tipo de boleto identificado pelo valor majoritário (excluindo zerados):
-  - 15,00 -> pode ser Funcionários OU Dependentes.
-      Como diferenciar? Pelo arquivo: "Controle de Pagamentos" tem coluna
-      "Nome Dependente" -> Odonto Dependentes. Os "Calculo relação" são Funcionários.
-  - 18,50 -> Afetos
-  - 10,00 -> Telemedicina
+Tipo de boleto (dependentes vs funcionários):
+  - NOVO formato: se o título (row 1) contém "dependente" -> Odonto Dependentes.
+  - ANTIGO formato: "Controle de Pagamentos" no nome do arquivo -> Odonto Dependentes.
+  - Fallback: presença da coluna "Nome Dependente" ou "Nome" (com CPF Titular) -> Dependentes.
+  - Caso contrário identifica pelo valor majoritário:
+      15,00 -> Funcionários / 18,50 -> Afetos / 10,00 -> Telemedicina.
+
+DOIS LAYOUTS SUPORTADOS:
+
+  ANTIGO ("Controle de Pagamentos"):
+    Row 1 = header direto
+    Colunas: Nome Funcionario | CPF Funcionário | Data Admissão |
+             Nome Dependente  | CPF Dependente  | Valor | Serviços
+
+  NOVO ("Relação de dependente para SINDSEG/SINDIVIGILANTES"):
+    Row 1 = "Relação de dependente para SINDSEG-GV/ES <data>"
+    Row 2 = "Empresa: ... / Vencimento: ... / Período: ..."
+    Row 3 = header: Titular | CPF Titular | Nome | CPF |
+                    Data Inclusão | Mês Vigente | Sindicato | Valor | Status
+
+Após a leitura, ambos os formatos são normalizados para as MESMAS colunas internas:
+  Nome Funcionario, CPF Funcionário, Nome Dependente, CPF Dependente, Valor, Valor_num
+(garantindo que o restante do pipeline continue funcionando sem alterações).
 
 Saída: planilha tratada por boleto + uma aba consolidada por CCusto.
 """
@@ -51,37 +70,110 @@ VALOR_PARA_TIPO_FUNC = {
 TOL = 0.01
 
 
-def identificar_sindicato(nome_arquivo: str, pasta: str = "") -> str:
-    """Retorna 'SINDSEG' ou 'SINDIVIGILANTES' (ou '' se não identificado)."""
-    base = f"{nome_arquivo} {pasta}".upper()
-    if "SINDIVIGILANTES" in base:
-        return "SINDIVIGILANTES"
-    if "SINDSEG" in base:
-        return "SINDSEG"
+# ---------- Detecção de layout ----------
+
+def _linha_titulo_novo_formato(df_raw: pd.DataFrame) -> str:
+    """
+    No novo formato, a row 0 é um texto tipo:
+        "Relação de dependente para SINDSEG-GV/ES 14-07-2026"
+    Retorna esse texto (ou string vazia).
+    """
+    if df_raw.empty:
+        return ""
+    try:
+        primeira = df_raw.iloc[0].tolist()
+    except Exception:
+        return ""
+    for cell in primeira:
+        if cell is None:
+            continue
+        text = str(cell).strip()
+        if "RELAÇÃO" in text.upper() or "RELACAO" in text.upper():
+            return text
     return ""
 
 
-def identificar_tipo_boleto(df_raw: pd.DataFrame, nome_arquivo: str = "") -> str:
+def _eh_novo_formato(df_raw: pd.DataFrame) -> bool:
+    """Novo formato: row 0 é título + row 2 é header 'Titular ... CPF Titular ...'."""
+    if len(df_raw) < 3:
+        return False
+    try:
+        row2 = [str(x).strip() for x in df_raw.iloc[2].tolist()]
+    except Exception:
+        return False
+    upper = [c.upper() for c in row2]
+    return "TITULAR" in upper and "CPF TITULAR" in upper
+
+
+# ---------- Identificação de sindicato e tipo ----------
+
+def identificar_sindicato(
+    nome_arquivo: str = "",
+    pasta: str = "",
+    titulo_planilha: str = "",
+    coluna_sindicato_valores: Optional[list] = None,
+) -> str:
+    """
+    Retorna 'SINDSEG' ou 'SINDIVIGILANTES' (ou '' se não identificado).
+
+    Ordem de prioridade:
+      1) título dentro da planilha (novo formato)
+      2) coluna 'Sindicato' dos dados (novo formato)
+      3) nome do arquivo
+      4) pasta
+    """
+    for fonte in (titulo_planilha, nome_arquivo, pasta):
+        base = str(fonte or "").upper()
+        if "SINDIVIGILANTES" in base:
+            return "SINDIVIGILANTES"
+        if "SINDSEG" in base:
+            return "SINDSEG"
+
+    if coluna_sindicato_valores:
+        joined = " ".join(str(v).upper() for v in coluna_sindicato_valores if v)
+        if "SINDIVIGILANTES" in joined:
+            return "SINDIVIGILANTES"
+        if "SINDSEG" in joined:
+            return "SINDSEG"
+
+    return ""
+
+
+def identificar_tipo_boleto(
+    df_raw: pd.DataFrame,
+    nome_arquivo: str = "",
+    titulo_planilha: str = "",
+    tem_cpf_titular: bool = False,
+) -> str:
     """
     Identifica o tipo de boleto a partir do conteúdo + nome do arquivo.
 
     Retorna um dos: 'Odonto - Funcionários', 'Odonto - Dependentes',
                     'Afetos', 'Telemedicina'.
     """
-    nome_up = nome_arquivo.upper()
+    nome_up = (nome_arquivo or "").upper()
+    titulo_up = (titulo_planilha or "").upper()
 
-    # Se for "Controle de Pagamentos" -> Odonto Dependentes (tem "Nome Dependente")
+    # 1) Novo formato: título contém "dependente"
+    if "DEPENDENTE" in titulo_up:
+        return "Odonto - Dependentes"
+
+    # 2) Antigo formato: arquivo "Controle de Pagamentos"
     if "CONTROLE DE PAGAMENTOS" in nome_up or "DEPENDENTE" in nome_up:
         return "Odonto - Dependentes"
 
-    # Procurar a coluna "Nome Dependente" no conteúdo (qualquer linha do header)
+    # 3) Novo formato tem "CPF Titular" -> só planilhas de dependente têm isso
+    if tem_cpf_titular:
+        return "Odonto - Dependentes"
+
+    # 4) Procurar a coluna "Nome Dependente" no conteúdo (formato antigo em qualquer header)
     for i in range(min(5, len(df_raw))):
         row = [str(x).strip() for x in df_raw.iloc[i].tolist()]
         for cell in row:
             if "Nome Dependente" in cell:
                 return "Odonto - Dependentes"
 
-    # Caso contrário, identifica pelo valor majoritário
+    # 5) Caso contrário, identifica pelo valor majoritário
     valor_maj = _valor_majoritario(df_raw)
     if valor_maj is None:
         return "Odonto - Funcionários"
@@ -92,14 +184,12 @@ def identificar_tipo_boleto(df_raw: pd.DataFrame, nome_arquivo: str = "") -> str
         return "Telemedicina"
     if abs(valor_maj - 15.00) < TOL:
         return "Odonto - Funcionários"
-    # Fallback
     return "Odonto - Funcionários"
 
 
 def _valor_majoritario(df_raw: pd.DataFrame) -> Optional[float]:
     """Retorna o valor que mais aparece na planilha (ignorando 0 e NaN)."""
     valores = []
-    # Procurar a coluna "Valor"
     valor_col_idx = None
     header_row = None
     for i in range(min(8, len(df_raw))):
@@ -127,36 +217,111 @@ def _valor_majoritario(df_raw: pd.DataFrame) -> Optional[float]:
     return float(s.mode().iloc[0])
 
 
+# ---------- Normalização de colunas ----------
+
+# Mapeamento NOVO -> ANTIGO (nome interno padrão do pipeline)
+RENAME_NOVO_PARA_INTERNO = {
+    "Titular": "Nome Funcionario",
+    "CPF Titular": "CPF Funcionário",
+    "Nome": "Nome Dependente",
+    "CPF": "CPF Dependente",
+}
+
+
+def _normalizar_colunas(data: pd.DataFrame, novo_formato: bool) -> pd.DataFrame:
+    """
+    Padroniza os nomes de coluna do novo formato para o padrão antigo,
+    para que o restante do pipeline continue funcionando.
+
+    NOVO -> INTERNO
+      Titular      -> Nome Funcionario
+      CPF Titular  -> CPF Funcionário
+      Nome         -> Nome Dependente
+      CPF          -> CPF Dependente
+
+    Colunas novas mantidas quando existem: Data Inclusão, Mês Vigente,
+    Sindicato, Status. A coluna 'Serviços' do formato antigo é opcional.
+    """
+    if not novo_formato:
+        return data
+
+    renames = {k: v for k, v in RENAME_NOVO_PARA_INTERNO.items() if k in data.columns}
+    if renames:
+        data = data.rename(columns=renames)
+    return data
+
+
+# ---------- Leitura do boleto ----------
+
 def carregar_boleto_samp(file_like, nome_arquivo: str = "", pasta: str = "") -> dict:
     """
     Lê uma planilha de boleto SAMP (VSP) e identifica sindicato + tipo.
+
+    Suporta AMBOS os formatos:
+      - Antigo (Controle de Pagamentos) -> header na linha 0.
+      - Novo (Relação de dependente para SINDSEG/SINDIVIGILANTES) ->
+        row 0 = título, row 1 = empresa/vencimento, row 2 = header.
     """
     df_raw = ler_excel_qualquer(file_like, header=None, sheet=0)
 
-    sindicato = identificar_sindicato(nome_arquivo, pasta)
-    tipo = identificar_tipo_boleto(df_raw, nome_arquivo)
+    titulo = _linha_titulo_novo_formato(df_raw)
+    novo_formato = _eh_novo_formato(df_raw)
 
-    # Detecta linha do header e onde começa a tabela
-    header_row = None
-    for i in range(min(8, len(df_raw))):
-        row = [str(x).strip() for x in df_raw.iloc[i].tolist()]
-        if "Nome" in row[:2] or "Nome Funcionario" in row or "Nome Funcionário" in row:
-            header_row = i
-            break
-
-    if header_row is None:
-        header_row = 2  # default visto nos arquivos
+    # Detecta linha do header:
+    #  - Novo formato -> row index 2 (terceira linha)
+    #  - Antigo formato -> primeira linha que contém "Nome"/"Nome Funcionario"
+    if novo_formato:
+        header_row = 2
+    else:
+        header_row = None
+        for i in range(min(8, len(df_raw))):
+            row = [str(x).strip() for x in df_raw.iloc[i].tolist()]
+            if (
+                "Nome" in row[:2]
+                or "Nome Funcionario" in row
+                or "Nome Funcionário" in row
+            ):
+                header_row = i
+                break
+        if header_row is None:
+            header_row = 0  # fallback seguro
 
     headers = [str(x).strip() for x in df_raw.iloc[header_row].tolist()]
     data = df_raw.iloc[header_row + 1:].copy()
     data.columns = headers
     data = data.reset_index(drop=True)
 
-    # Normalizações
-    # Possíveis colunas: Nome, CPF, Data Admissão, Sexo, Sindicato,
-    # Ultima modificação status, Valor, Status, Serviços
-    # OU (controle pagamentos): Nome Funcionario, CPF Funcionário, Data Admissão,
-    # Nome Dependente, CPF Dependente, Valor, Serviços
+    # Remove colunas totalmente vazias (row 2 do novo formato tem células None)
+    data = data.loc[:, [c for c in data.columns if str(c).strip() and str(c).lower() != "nan"]]
+
+    # Detecta se o novo formato tem 'CPF Titular' (antes do rename)
+    tem_cpf_titular = "CPF Titular" in data.columns
+
+    # Coluna 'Sindicato' do novo formato ajuda a identificar o sindicato
+    coluna_sindicato_valores = (
+        data["Sindicato"].dropna().astype(str).unique().tolist()
+        if "Sindicato" in data.columns
+        else None
+    )
+
+    sindicato = identificar_sindicato(
+        nome_arquivo=nome_arquivo,
+        pasta=pasta,
+        titulo_planilha=titulo,
+        coluna_sindicato_valores=coluna_sindicato_valores,
+    )
+
+    tipo = identificar_tipo_boleto(
+        df_raw=df_raw,
+        nome_arquivo=nome_arquivo,
+        titulo_planilha=titulo,
+        tem_cpf_titular=tem_cpf_titular,
+    )
+
+    # PADRONIZA nomes de coluna do novo formato para o padrão do pipeline
+    data = _normalizar_colunas(data, novo_formato)
+
+    # Normalizações de tipos
     if "Nome" in data.columns:
         data["Nome"] = data["Nome"].apply(limpar_nome)
     if "Nome Funcionario" in data.columns:
@@ -180,8 +345,12 @@ def carregar_boleto_samp(file_like, nome_arquivo: str = "", pasta: str = "") -> 
         "sindicato": sindicato or "DESCONHECIDO",
         "tipo": tipo,
         "arquivo": nome_arquivo,
+        "titulo": titulo,
+        "novo_formato": novo_formato,
     }
 
+
+# ---------- Consolidação por CCusto ----------
 
 def consolidar_samp(boletos: list, dominio_df: pd.DataFrame) -> dict:
     """
@@ -204,7 +373,8 @@ def consolidar_samp(boletos: list, dominio_df: pd.DataFrame) -> dict:
     for b in boletos:
         df = b["df"].copy()
 
-        # Determina CPF do funcionário titular
+        # Determina CPF do funcionário titular (CCUSTO SEMPRE vem do titular,
+        # mesmo em boletos de dependentes)
         if "CPF Funcionário" in df.columns:
             cpf_col = "CPF Funcionário"
         elif "CPF" in df.columns:
@@ -218,7 +388,10 @@ def consolidar_samp(boletos: list, dominio_df: pd.DataFrame) -> dict:
             df["CCUSTO"] = ""
 
         # Resumo por CCusto (ignora zerados)
-        df_valid = df[df.get("Valor_num", 0).round(2) != 0.0] if "Valor_num" in df.columns else df.iloc[0:0]
+        df_valid = (
+            df[df.get("Valor_num", 0).round(2) != 0.0]
+            if "Valor_num" in df.columns else df.iloc[0:0]
+        )
         if not df_valid.empty:
             resumo = (
                 df_valid.groupby("CCUSTO", dropna=False, sort=False)["Valor_num"]
@@ -255,6 +428,8 @@ def consolidar_samp(boletos: list, dominio_df: pd.DataFrame) -> dict:
     return {"boletos": resultado_boletos, "resumo_geral": resumo_geral}
 
 
+# ---------- Exportação ----------
+
 def formatar_valor_br(v: float) -> str:
     try:
         s = f"{float(v):,.2f}"
@@ -276,7 +451,7 @@ def gerar_xlsx_samp_boleto(boleto: dict) -> bytes:
     ws.title = "Boleto"
 
     df = boleto["df"]
-    cols = [c for c in df.columns if not c.startswith("__") and c != "Valor_num"]
+    cols = [c for c in df.columns if not str(c).startswith("__") and c != "Valor_num"]
 
     for j, c in enumerate(cols, start=1):
         cell = ws.cell(row=1, column=j, value=c)
